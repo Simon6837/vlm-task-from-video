@@ -37,7 +37,7 @@ DEFAULT_INPUT_DIR = SCRIPT_DIR / "videos"
 RESULTS_DIR = SCRIPT_DIR / "results"
 DEFAULT_FRAME_COUNT = 12
 DEFAULT_CONTEXT_WINDOW = 16384
-PROMPT = "The person in the video is performing a task, Give me their exact workflow"
+PROMPT = "The person in the video is performing a task, Give me their exact workflow in the following json format: action, object,target and motion"
 
 
 def parse_args() -> argparse.Namespace:
