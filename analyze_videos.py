@@ -1,20 +1,23 @@
 """Describe the workflows in every MP4 under a directory with Ollama Vision.
 
 Llama 3.2 Vision accepts images rather than video files. This script therefore
-extracts evenly spaced video frames and attaches those images to one chat
-request for each video.
+combines evenly sampled video frames into one contact-sheet image and attaches
+it to one chat request for each video.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import math
 import re
 import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 try:
     import cv2
@@ -35,9 +38,21 @@ except ImportError as exc:  # pragma: no cover - depends on local environment
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT_DIR = SCRIPT_DIR / "videos"
 RESULTS_DIR = SCRIPT_DIR / "results"
-DEFAULT_FRAME_COUNT = 12
-DEFAULT_CONTEXT_WINDOW = 16384
-PROMPT = "The person in the video is performing a task, Give me their exact workflow in the following json format: action, object,target and motion"
+DEFAULT_FPS = 1
+MIN_CONTEXT_WINDOW = 4096
+IMAGE_TOKEN_ESTIMATE = 256
+RESPONSE_TOKEN_RESERVE = 2048
+CONTEXT_WINDOW_ALIGNMENT = 4096
+CONTACT_SHEET_COLUMNS = 5
+CONTACT_SHEET_TILE_WIDTH = 320
+CONTACT_SHEET_TILE_HEIGHT = 180
+CONTACT_SHEET_LABEL_HEIGHT = 24
+PROMPT = (
+    "The supplied image is a timestamped contact sheet made from a video. "
+    "The person in the video is performing a task. Return only a JSON array "
+    "with one object for each distinct action in chronological order. Each object "
+    "must contain these keys: action, object, target, and motion."
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,18 +70,17 @@ def parse_args() -> argparse.Namespace:
         help=f"Directory to scan recursively for MP4 files (default: {DEFAULT_INPUT_DIR})",
     )
     parser.add_argument(
-        "--frame-count",
-        type=int,
-        default=DEFAULT_FRAME_COUNT,
-        help=f"Evenly spaced frames to attach per video (default: {DEFAULT_FRAME_COUNT})",
+        "--fps",
+        type=float,
+        default=DEFAULT_FPS,
+        help=f"Frames to sample per second of video (default: {DEFAULT_FPS})",
     )
     parser.add_argument(
         "--context-window",
         type=int,
-        default=DEFAULT_CONTEXT_WINDOW,
         help=(
             "Ollama context window in tokens for each request "
-            f"(default: {DEFAULT_CONTEXT_WINDOW})"
+            "(default: calculate from the extracted frames)"
         ),
     )
     return parser.parse_args()
@@ -87,36 +101,123 @@ def output_path_for_model(model: str) -> Path:
     return RESULTS_DIR / f"{safe_model}.csv"
 
 
-def evenly_spaced_indices(total_frames: int, requested_count: int) -> list[int]:
-    """Return up to requested_count unique frame indexes spanning the video."""
+def frame_indices_at_fps(total_frames: int, source_fps: float, target_fps: float) -> list[int]:
+    """Return unique source-frame indexes sampled from timestamp zero at target_fps."""
     if total_frames <= 0:
         raise ValueError("video reports no frames")
+    if not math.isfinite(source_fps) or source_fps <= 0:
+        raise ValueError("video reports no usable FPS")
+    if not math.isfinite(target_fps) or target_fps <= 0:
+        raise ValueError("requested FPS must be greater than zero")
+    if target_fps >= source_fps:
+        return list(range(total_frames))
 
-    sample_count = min(total_frames, requested_count)
-    if sample_count == 1:
-        return [0]
-    return [round(index * (total_frames - 1) / (sample_count - 1)) for index in range(sample_count)]
+    sample_count = math.ceil(total_frames * target_fps / source_fps)
+    indices: list[int] = []
+    for sample_number in range(sample_count):
+        frame_index = int(sample_number * source_fps / target_fps)
+        if frame_index >= total_frames:
+            break
+        if not indices or frame_index != indices[-1]:
+            indices.append(frame_index)
+    return indices
 
 
-def extract_frames(video_path: Path, destination: Path, frame_count: int) -> list[Path]:
+def round_up_to_context_window(value: int) -> int:
+    """Round a token requirement up to an Ollama-friendly context size."""
+    return max(
+        MIN_CONTEXT_WINDOW,
+        math.ceil(value / CONTEXT_WINDOW_ALIGNMENT) * CONTEXT_WINDOW_ALIGNMENT,
+    )
+
+
+def calculated_context_window(image_count: int) -> int:
+    """Reserve image and response tokens for one video request."""
+    if image_count < 1:
+        raise ValueError("at least one image is required")
+    return round_up_to_context_window(image_count * IMAGE_TOKEN_ESTIMATE + RESPONSE_TOKEN_RESERVE)
+
+
+def context_window_from_error(error: Exception) -> int | None:
+    """Return a safe context size when Ollama reports the actual prompt token count."""
+    match = re.search(r'"n_prompt_tokens"\s*:\s*(\d+)', str(error))
+    if match is None:
+        return None
+    return round_up_to_context_window(int(match.group(1)) + RESPONSE_TOKEN_RESERVE)
+
+
+def timestamp_label(seconds: float) -> str:
+    """Format a sampled frame's offset in a compact, human-readable form."""
+    whole_seconds = max(0, int(seconds))
+    minutes, seconds = divmod(whole_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def contact_sheet_canvas(frame_count: int) -> np.ndarray:
+    """Create a white five-column contact-sheet canvas for sampled frames."""
+    if frame_count < 1:
+        raise ValueError("at least one extracted frame is required")
+    rows = math.ceil(frame_count / CONTACT_SHEET_COLUMNS)
+    tile_height = CONTACT_SHEET_LABEL_HEIGHT + CONTACT_SHEET_TILE_HEIGHT
+    return np.full(
+        (rows * tile_height, CONTACT_SHEET_COLUMNS * CONTACT_SHEET_TILE_WIDTH, 3),
+        255,
+        dtype=np.uint8,
+    )
+
+
+def add_frame_to_contact_sheet(
+    sheet: np.ndarray, frame: np.ndarray, output_index: int, timestamp_seconds: float
+) -> None:
+    """Letterbox one frame in its contact-sheet tile and label its timestamp."""
+    row, column = divmod(output_index, CONTACT_SHEET_COLUMNS)
+    tile_x = column * CONTACT_SHEET_TILE_WIDTH
+    tile_y = row * (CONTACT_SHEET_LABEL_HEIGHT + CONTACT_SHEET_TILE_HEIGHT)
+    frame_height, frame_width = frame.shape[:2]
+    scale = min(CONTACT_SHEET_TILE_WIDTH / frame_width, CONTACT_SHEET_TILE_HEIGHT / frame_height)
+    resized_width = max(1, round(frame_width * scale))
+    resized_height = max(1, round(frame_height * scale))
+    resized = cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+    frame_x = tile_x + (CONTACT_SHEET_TILE_WIDTH - resized_width) // 2
+    frame_y = tile_y + CONTACT_SHEET_LABEL_HEIGHT + (CONTACT_SHEET_TILE_HEIGHT - resized_height) // 2
+    sheet[frame_y : frame_y + resized_height, frame_x : frame_x + resized_width] = resized
+    cv2.putText(
+        sheet,
+        timestamp_label(timestamp_seconds),
+        (tile_x + 6, tile_y + 17),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def create_contact_sheet(video_path: Path, destination: Path, fps: float) -> Path:
+    """Create one timestamped contact-sheet JPEG from every sampled video frame."""
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError("could not open video")
 
     try:
         total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-        frame_paths: list[Path] = []
-        for output_index, frame_index in enumerate(evenly_spaced_indices(total_frames, frame_count)):
+        source_fps = capture.get(cv2.CAP_PROP_FPS)
+        frame_indices = frame_indices_at_fps(total_frames, source_fps, fps)
+        sheet = contact_sheet_canvas(len(frame_indices))
+        for output_index, frame_index in enumerate(frame_indices):
             capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
             success, frame = capture.read()
             if not success:
                 raise RuntimeError(f"could not decode frame {frame_index}")
+            add_frame_to_contact_sheet(sheet, frame, output_index, frame_index / source_fps)
 
-            frame_path = destination / f"frame_{output_index + 1:02d}.jpg"
-            if not cv2.imwrite(str(frame_path), frame):
-                raise RuntimeError(f"could not write temporary frame {frame_index}")
-            frame_paths.append(frame_path)
-        return frame_paths
+        sheet_path = destination / "contact_sheet.jpg"
+        if not cv2.imwrite(str(sheet_path), sheet):
+            raise RuntimeError("could not write temporary contact sheet")
+        return sheet_path
     finally:
         capture.release()
 
@@ -138,27 +239,43 @@ class PromptExecutionError(Exception):
 
 
 def analyze_video(
-    video_path: Path, model: str, frame_count: int, context_window: int
+    video_path: Path, model: str, fps: float, context_window: int | None
 ) -> tuple[str, float]:
-    with tempfile.TemporaryDirectory(prefix="ollama_video_frames_") as temporary_directory:
-        frame_paths = extract_frames(video_path, Path(temporary_directory), frame_count)
-        started_at = time.perf_counter()
-        try:
-            response = ollama.chat(
-                model=model,
-                messages=[
+    try:
+        with tempfile.TemporaryDirectory(prefix="ollama_contact_sheet_") as temporary_directory:
+            contact_sheet_path = create_contact_sheet(video_path, Path(temporary_directory), fps)
+            selected_context_window = context_window or calculated_context_window(1)
+            chat_arguments: dict[str, Any] = {
+                "model": model,
+                "messages": [
                     {
                         "role": "user",
                         "content": PROMPT,
-                        "images": [str(frame_path) for frame_path in frame_paths],
+                        "images": [str(contact_sheet_path)],
                     }
                 ],
-                options={"num_ctx": context_window},
-            )
-        except Exception as exc:
-            raise PromptExecutionError(exc, time.perf_counter() - started_at) from exc
-        elapsed_seconds = time.perf_counter() - started_at
-    return response_text(response).strip(), elapsed_seconds
+                "options": {"num_ctx": selected_context_window},
+            }
+            started_at = time.perf_counter()
+            try:
+                response = ollama.chat(**chat_arguments)
+            except Exception as exc:
+                retry_context_window = (
+                    context_window_from_error(exc) if context_window is None else None
+                )
+                if retry_context_window is None or retry_context_window <= selected_context_window:
+                    raise PromptExecutionError(exc, time.perf_counter() - started_at) from exc
+                chat_arguments["options"] = {"num_ctx": retry_context_window}
+                try:
+                    response = ollama.chat(**chat_arguments)
+                except Exception as retry_exc:
+                    raise PromptExecutionError(
+                        retry_exc, time.perf_counter() - started_at
+                    ) from retry_exc
+            elapsed_seconds = time.perf_counter() - started_at
+        return response_text(response).strip(), elapsed_seconds
+    finally:
+        unload_model(model)
 
 
 def write_csv(rows: list[dict[str, str]], output_path: Path) -> None:
@@ -185,7 +302,7 @@ def pull_model(model: str) -> None:
 
 
 def unload_model(model: str) -> None:
-    """Release the model from Ollama after the complete batch has finished."""
+    """Release the model and its context after one video request."""
     print(f"Unloading Ollama model: {model}")
     try:
         ollama.generate(model=model, keep_alive=0)
@@ -201,8 +318,10 @@ def main() -> int:
     input_dir = args.input_dir.resolve()
     output_path = output_path_for_model(args.model)
 
-    if args.frame_count < 1 or args.context_window < 1:
-        print("--frame-count and --context-window must both be at least 1", file=sys.stderr)
+    if not math.isfinite(args.fps) or args.fps <= 0 or (
+        args.context_window is not None and args.context_window < 1
+    ):
+        print("--fps and --context-window must both be greater than zero", file=sys.stderr)
         return 2
     if not input_dir.is_dir():
         print(f"Input directory does not exist: {input_dir}", file=sys.stderr)
@@ -217,6 +336,7 @@ def main() -> int:
         )
         return 1
 
+    video_attempted = False
     try:
         videos = find_videos(input_dir)
         if not videos:
@@ -241,8 +361,9 @@ def main() -> int:
                 continue
 
             try:
+                video_attempted = True
                 workflow, elapsed_seconds = analyze_video(
-                    video_path, args.model, args.frame_count, args.context_window
+                    video_path, args.model, args.fps, args.context_window
                 )
                 prompt_execution_seconds = f"{elapsed_seconds:.3f}"
                 if not workflow:
@@ -281,7 +402,8 @@ def main() -> int:
         print(f"Wrote {len(rows)} rows to {output_path}")
         return 0
     finally:
-        unload_model(args.model)
+        if not video_attempted:
+            unload_model(args.model)
 
 
 if __name__ == "__main__":
