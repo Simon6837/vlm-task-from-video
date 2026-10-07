@@ -2,7 +2,9 @@
 
 This script pulls the Ollama model supplied on the command line, then asks it to describe the workflow shown in every MP4 file below `videos/`.
 
-Ollama vision models accept images, not video files. For each video, the script extracts 12 evenly spaced JPEG frames, attaches them to one Ollama request with the configured prompt, and writes the response to `video_workflows.csv`. The request uses a 16,384-token context window because the 12 images exceed Ollama's 4,096-token default.
+Ollama vision models accept images, not video files. For each video, the script samples frames at 1 FPS by default and combines every sampled frame into one timestamped, five-column contact-sheet JPEG. It attaches that single image to one Ollama request and writes the response to `video_workflows.csv`. By default, the script reserves context for one image and retries once with Ollama's reported prompt-token count if necessary. It unloads the model and clears its context after every video. Use `--context-window` to set a fixed context size explicitly.
+
+The prompt asks Ollama for a JSON object containing chronological human actions, approximate start and end timestamps, and directly handled objects or operated machines. The script stores Ollama's response as returned; it does not parse or validate JSON.
 
 ## Setup
 
@@ -18,14 +20,14 @@ python -m pip install -r requirements.txt
 python analyze_videos.py gemma4:e4b
 ```
 
-The script pulls `gemma4:e4b` automatically, keeps it loaded while processing the batch, then unloads it when processing finishes. It writes `results/gemma4-e4b.csv`. Windows does not allow `:` in filenames, so model-name characters that Windows forbids are replaced with `-`; the model tag is retained. The output CSV has `video_filename`, `prompt_execution_seconds`, and `workflow` columns. `prompt_execution_seconds` measures each Ollama request only, excluding model download and frame extraction. A failed video still receives a row; its workflow value starts with `ERROR:`.
+The script pulls `gemma4:e4b` automatically and unloads it after each video. It writes `results/gemma4-e4b.csv`. Windows does not allow `:` in filenames, so model-name characters that Windows forbids are replaced with `-`; the model tag is retained. The output CSV has `video_filename`, `prompt_execution_seconds`, and `workflow` columns. `prompt_execution_seconds` measures Ollama request attempts for that video only, excluding model download and frame extraction. A failed video still receives a row; its workflow value starts with `ERROR:`.
 
-Use `python analyze_videos.py --help` to change the input directory, frame count, or context window.
+Use `python analyze_videos.py --help` to change the input directory, sampling FPS, or context window. Higher FPS adds more tiles to the one contact sheet; for long videos, this makes each tile smaller.
 
-If the available memory cannot support a 16,384-token context window, use fewer frames instead:
+For fast actions, sample more frequently. If needed, set an explicit context window:
 
 ```powershell
-python analyze_videos.py gemma4:e4b --frame-count 8 --context-window 8192
+python analyze_videos.py gemma4:e4b --fps 2 --context-window 8192
 ```
 
 ## Llama 3.2 Vision compatibility
