@@ -4,7 +4,7 @@ This script pulls the Ollama model supplied on the command line, then asks it to
 
 Ollama vision models accept images, not video files. For each video, the script samples frames at 1 FPS by default and combines every sampled frame into one timestamped, five-column contact-sheet JPEG. It attaches that single image to one Ollama request and writes the response to `video_workflows.csv`. By default, the script reserves context for one image and retries once with Ollama's reported prompt-token count if necessary. It unloads the model and clears its context after every video. Use `--context-window` to set a fixed context size explicitly.
 
-Each `workflow` value is a JSON array. Every element represents one distinct action, in chronological order, with `action`, `object`, `target`, and `motion` fields.
+The prompt asks Ollama for a JSON object containing chronological human actions, approximate start and end timestamps, and directly handled objects or operated machines. The script stores Ollama's response as returned; it does not parse or validate JSON.
 
 ## Setup
 

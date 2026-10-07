@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import re
 import sys
@@ -47,11 +48,25 @@ CONTACT_SHEET_COLUMNS = 5
 CONTACT_SHEET_TILE_WIDTH = 320
 CONTACT_SHEET_TILE_HEIGHT = 180
 CONTACT_SHEET_LABEL_HEIGHT = 24
+OUTPUT_FORMAT = {
+    "actions": [
+        {
+            "start_time": "0:00",
+            "end_time": "0:04",
+            "action": "positions the shoe upper",
+            "objects": ["shoe upper"],
+            "machines": ["sewing machine"],
+        }
+    ]
+}
 PROMPT = (
     "The supplied image is a timestamped contact sheet made from a video. "
-    "The person in the video is performing a task. Return only a JSON array "
-    "with one object for each distinct action in chronological order. Each object "
-    "must contain these keys: action, object, target, and motion."
+    "Return only JSON following this structure: "
+    f"{json.dumps(OUTPUT_FORMAT, separators=(',', ':'))}. "
+    "List every distinct action performed by the human in chronological order. Use the "
+    "visible contact-sheet timestamps for approximate start_time and end_time. List only "
+    "objects directly handled and machines directly operated in that action; use empty "
+    "arrays when none apply."
 )
 
 
@@ -256,6 +271,7 @@ def analyze_video(
                 ],
                 "options": {"num_ctx": selected_context_window},
             }
+            chat_arguments["options"]["temperature"] = 0
             started_at = time.perf_counter()
             try:
                 response = ollama.chat(**chat_arguments)
@@ -265,7 +281,10 @@ def analyze_video(
                 )
                 if retry_context_window is None or retry_context_window <= selected_context_window:
                     raise PromptExecutionError(exc, time.perf_counter() - started_at) from exc
-                chat_arguments["options"] = {"num_ctx": retry_context_window}
+                chat_arguments["options"] = {
+                    "num_ctx": retry_context_window,
+                    "temperature": 0,
+                }
                 try:
                     response = ollama.chat(**chat_arguments)
                 except Exception as retry_exc:
